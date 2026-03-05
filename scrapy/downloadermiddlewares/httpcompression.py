@@ -1,88 +1,14 @@
 from __future__ import annotations
-
-import warnings
-from itertools import chain
-from logging import getLogger
-from typing import TYPE_CHECKING, Any
-
-from scrapy import Request, Spider, signals
-from scrapy.exceptions import IgnoreRequest, NotConfigured
-from scrapy.http import Response, TextResponse
-from scrapy.responsetypes import responsetypes
-from scrapy.utils._compression import (
-    _DecompressionMaxSizeExceeded,
-    _inflate,
-    _unbrotli,
-    _unzstd,
-)
-from scrapy.utils.decorators import _warn_spider_arg
-from scrapy.utils.deprecate import warn_on_deprecated_spider_attribute
-from scrapy.utils.gz import gunzip
-
-if TYPE_CHECKING:
-    # typing.Self requires Python 3.11
-    from typing_extensions import Self
-
-    from scrapy.crawler import Crawler
-    from scrapy.statscollectors import StatsCollector
-
-
-logger = getLogger(__name__)
-
-ACCEPTED_ENCODINGS: list[bytes] = [b"gzip", b"deflate"]
-
-try:
-    try:
-        import brotli
-    except ImportError:
-        import brotlicffi as brotli
-except ImportError:
-    pass
-else:
-    try:
-        brotli.Decompressor.can_accept_more_data
-    except AttributeError:  # pragma: no cover
-        warnings.warn(
-            "You have brotli installed. But 'br' encoding support now requires "
-            "brotli's or brotlicffi's version >= 1.2.0. Please upgrade "
-            "brotli/brotlicffi to make Scrapy decode 'br' encoded responses.",
-        )
-    else:
-        ACCEPTED_ENCODINGS.append(b"br")
-
-try:
-    import zstandard  # noqa: F401
-except ImportError:
-    pass
-else:
-    ACCEPTED_ENCODINGS.append(b"zstd")
-
-
-class HttpCompressionMiddleware:
-    """This middleware allows compressed (gzip, deflate) traffic to be
-    sent/received from websites"""
-
-    def __init__(
-        self,
-        stats: StatsCollector | None = None,
-        *,
-        crawler: Crawler | None = None,
-    ):
-        if not crawler:
-            self.stats = stats
-            self._max_size = 1073741824
-            self._warn_size = 33554432
-            return
-        self.stats = crawler.stats
-        self._max_size = crawler.settings.getint("DOWNLOAD_MAXSIZE")
         self._warn_size = crawler.settings.getint("DOWNLOAD_WARNSIZE")
         crawler.signals.connect(self.open_spider, signals.spider_opened)
+
 
     @classmethod
     def from_crawler(cls, crawler: Crawler) -> Self:
         if not crawler.settings.getbool("COMPRESSION_ENABLED"):
             raise NotConfigured
         return cls(crawler=crawler)
+
 
     def open_spider(self, spider: Spider) -> None:
         if hasattr(spider, "download_maxsize"):
@@ -94,12 +20,14 @@ class HttpCompressionMiddleware:
             )
             self._warn_size = spider.download_warnsize
 
+
     @_warn_spider_arg
     def process_request(
         self, request: Request, spider: Spider | None = None
     ) -> Request | Response | None:
         request.headers.setdefault("Accept-Encoding", b", ".join(ACCEPTED_ENCODINGS))
         return None
+
 
     @_warn_spider_arg
     def process_response(
@@ -110,6 +38,11 @@ class HttpCompressionMiddleware:
         if isinstance(response, Response):
             content_encoding = response.headers.getlist("Content-Encoding")
             if content_encoding:
+                # Preserve the original Content-Encoding so spiders can
+                # see what encoding the server used (see #1988).
+                original_encoding = b", ".join(content_encoding).decode(
+                    "ascii", errors="replace"
+                )
                 max_size = request.meta.get("download_maxsize", self._max_size)
                 warn_size = request.meta.get("download_warnsize", self._warn_size)
                 try:
@@ -149,8 +82,13 @@ class HttpCompressionMiddleware:
                 response = response.replace(cls=respcls, **kwargs)
                 if not content_encoding:
                     del response.headers["Content-Encoding"]
+                # Store the original Content-Encoding value so spider
+                # callbacks can access it via response.meta.
+                response.meta["original_content_encoding"] = original_encoding
+
 
         return response
+
 
     def _handle_encoding(
         self, body: bytes, content_encoding: list[bytes], max_size: int
@@ -159,6 +97,7 @@ class HttpCompressionMiddleware:
         for encoding in to_decode:
             body = self._decode(body, encoding, max_size)
         return body, to_keep
+
 
     @staticmethod
     def _split_encodings(
@@ -172,37 +111,3 @@ class HttpCompressionMiddleware:
             )
         ]
         to_decode: list[bytes] = []
-        while to_keep:
-            encoding = to_keep.pop()
-            if encoding not in supported_encodings:
-                to_keep.append(encoding)
-                return to_decode, to_keep
-            to_decode.append(encoding)
-        return to_decode, to_keep
-
-    @staticmethod
-    def _decode(body: bytes, encoding: bytes, max_size: int) -> bytes:
-        if encoding in {b"gzip", b"x-gzip"}:
-            return gunzip(body, max_size=max_size)
-        if encoding == b"deflate":
-            return _inflate(body, max_size=max_size)
-        if encoding == b"br":
-            return _unbrotli(body, max_size=max_size)
-        if encoding == b"zstd":
-            return _unzstd(body, max_size=max_size)
-        # shouldn't be reached
-        return body  # pragma: no cover
-
-    def _warn_unknown_encoding(
-        self, response: Response, encodings: list[bytes]
-    ) -> None:
-        encodings_str = b",".join(encodings).decode()
-        msg = (
-            f"{self.__class__.__name__} cannot decode the response for {response.url} "
-            f"from unsupported encoding(s) '{encodings_str}'."
-        )
-        if b"br" in encodings:
-            msg += " You need to install brotli or brotlicffi >= 1.2.0 to decode 'br'."
-        if b"zstd" in encodings:
-            msg += " You need to install zstandard to decode 'zstd'."
-        logger.warning(msg)
